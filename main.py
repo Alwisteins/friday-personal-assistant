@@ -10,6 +10,7 @@ from urllib import parse, request
 from urllib.error import HTTPError, URLError
 from zoneinfo import ZoneInfo
 from dotenv import load_dotenv
+from google_auth import fetch_upcoming_events
 
 RESET = "\033[0m"
 YOU_COLOR = "\033[94m"
@@ -278,17 +279,23 @@ def build_start_my_day_prompt(user_input):
     weather_query = get_weather_query()
     time_snapshot = get_current_time_snapshot()
     weather_snapshot = fetch_weather_snapshot(weather_query)
+    calendar_snapshot = fetch_upcoming_events()
     day_period = time_snapshot["day_period"]
+    agenda_lines = format_calendar_snapshot(calendar_snapshot)
 
     live_data_lines = [
         "LIVE DATA",
         f"Waktu: {time_snapshot['formatted']} ({time_snapshot['timezone']})",
         f"Lokasi default: {location}",
         f"Cuaca ({weather_snapshot['location']}): {weather_snapshot['summary']}",
+        f"Kalender: {calendar_snapshot['summary']}",
+        "Agenda 24 jam ke depan:",
+        *agenda_lines,
         "Aturan:",
-        "- Gunakan hanya live data yang disediakan di atas untuk waktu dan cuaca.",
+        "- Gunakan hanya live data yang disediakan di atas untuk waktu, cuaca, dan kalender.",
         "- Jika ada field yang unavailable, katakan apa adanya.",
         "- Jika cuaca unavailable, sebutkan alasan spesifik yang tertulis di LIVE DATA. Jangan bilang data tidak disediakan aplikasi jika sebenarnya fetch cuaca gagal.",
+        "- Jika kalender unavailable, sebutkan alasan spesifik yang tertulis di LIVE DATA.",
         "- Jangan mengarang data Notion, Calendar, atau Email jika belum ada data terhubung di pesan ini.",
         "- Gunakan format output yang konsisten dan terminal-friendly.",
         "- Untuk pembuka, gunakan struktur ini persis:",
@@ -296,13 +303,40 @@ def build_start_my_day_prompt(user_input):
         "  - Waktu: <isi dari LIVE DATA>",
         "  - Lokasi: <isi dari LIVE DATA>",
         "  - Cuaca: <isi dari LIVE DATA>",
+        "  - Agenda: <ringkas isi dari LIVE DATA kalender>",
         f"- Setelah itu, tulis `Brief {day_period}:` lalu beri 2 sampai 4 poin actionable.",
+        "- Jika ada agenda, prioritaskan agenda itu dalam brief.",
         f"- Jika cuaca relevan, masukkan saran praktis singkat di `Brief {day_period}:`.",
         f"- Pilih label waktu yang sesuai dengan jam pada LIVE DATA. Untuk jam {time_snapshot['formatted']}, gunakan `{day_period}`, bukan label waktu lain.",
         "",
         f"User request: {user_input}",
     ]
     return "\n".join(live_data_lines)
+
+
+def format_calendar_snapshot(calendar_snapshot):
+    if calendar_snapshot["status"] != "ok":
+        return [f"- Unavailable: {calendar_snapshot['summary']}"]
+
+    if not calendar_snapshot["events"]:
+        return ["- Tidak ada agenda"]
+
+    lines = []
+    for event in calendar_snapshot["events"]:
+        start_label = format_event_start(event["start"], event["is_all_day"])
+        lines.append(f"- {start_label} {event['summary']}")
+    return lines
+
+
+def format_event_start(start_value, is_all_day):
+    if is_all_day:
+        return f"[All day {start_value}]"
+
+    try:
+        event_time = datetime.fromisoformat(start_value.replace("Z", "+00:00"))
+        return event_time.strftime("[%d %b %H:%M]")
+    except ValueError:
+        return f"[{start_value}]"
 
 
 def extract_grounding_sources(response):
