@@ -7,13 +7,16 @@ from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 
-SCOPES = ["https://www.googleapis.com/auth/calendar.readonly"]
+SCOPES = ["https://www.googleapis.com/auth/calendar", "https://mail.google.com/"]
 BASE_DIR = os.path.dirname(__file__)
 CREDENTIALS_PATH = os.path.join(BASE_DIR, "credentials.json")
 TOKEN_PATH = os.path.join(BASE_DIR, "token.json")
 
 
 def _load_credentials():
+    if not os.path.exists(CREDENTIALS_PATH):
+        raise FileNotFoundError("credentials.json belum ditemukan")
+
     creds = None
     if os.path.exists(TOKEN_PATH):
         creds = Credentials.from_authorized_user_file(TOKEN_PATH, SCOPES)
@@ -31,9 +34,33 @@ def _load_credentials():
     return creds
 
 
+def ensure_google_login():
+    try:
+        _load_credentials()
+        return {
+            "status": "ok",
+            "summary": "Google OAuth sudah tersimpan atau berhasil dilogin ulang",
+        }
+    except FileNotFoundError as error:
+        return {
+            "status": "unavailable",
+            "summary": str(error),
+        }
+    except Exception as error:
+        return {
+            "status": "unavailable",
+            "summary": f"gagal login Google: {error}",
+        }
+
+
 def get_calendar_service():
     creds = _load_credentials()
-    return build('calendar', 'v3', credentials=creds)
+    return build("calendar", "v3", credentials=creds)
+
+
+def get_gmail_service():
+    creds = _load_credentials()
+    return build("gmail", "v1", credentials=creds)
 
 
 def fetch_upcoming_events(max_results=5):
@@ -96,4 +123,91 @@ def fetch_upcoming_events(max_results=5):
             "status": "unavailable",
             "summary": f"gagal mengambil agenda kalender: {error}",
             "events": [],
+        }
+
+
+def _extract_email_headers(payload):
+    headers = {}
+    for header in payload.get("headers", []):
+        name = header.get("name")
+        value = header.get("value")
+        if name and value is not None:
+            headers[name.lower()] = value
+    return headers
+
+
+def fetch_recent_emails(max_results=5, query="in:inbox newer_than:1d"):
+    if not os.path.exists(CREDENTIALS_PATH):
+        return {
+            "status": "unavailable",
+            "summary": "credentials.json belum ditemukan",
+            "emails": [],
+        }
+
+    try:
+        service = get_gmail_service()
+        result = (
+            service.users()
+            .messages()
+            .list(
+                userId="me",
+                maxResults=max_results,
+                q=query,
+            )
+            .execute()
+        )
+        items = result.get("messages", [])
+        emails = []
+
+        for item in items:
+            message = (
+                service.users()
+                .messages()
+                .get(
+                    userId="me",
+                    id=item["id"],
+                    format="metadata",
+                    metadataHeaders=["From", "Subject", "Date"],
+                )
+                .execute()
+            )
+
+            payload = message.get("payload", {})
+            headers = _extract_email_headers(payload)
+            snippet = (message.get("snippet") or "").strip()
+
+            emails.append(
+                {
+                    "id": message.get("id", item["id"]),
+                    "thread_id": message.get("threadId", ""),
+                    "from": headers.get("from", "(Unknown sender)"),
+                    "subject": headers.get("subject", "(No subject)"),
+                    "date": headers.get("date", ""),
+                    "snippet": snippet,
+                }
+            )
+
+        if not emails:
+            return {
+                "status": "ok",
+                "summary": "tidak ada email baru di inbox",
+                "emails": [],
+            }
+
+        return {
+            "status": "ok",
+            "summary": f"{len(emails)} email terbaru ditemukan",
+            "emails": emails,
+        }
+    except HttpError as error:
+        return {
+            "status": "unavailable",
+            "summary": f"Gmail API error: {error}",
+            "emails": [],
+        }
+    except Exception as error:
+        return {
+            "status": "unavailable",
+            "summary": f"gagal mengambil email: {error}",
+            "emails": [],
         }
