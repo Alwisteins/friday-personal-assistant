@@ -10,7 +10,8 @@ from urllib import parse, request
 from urllib.error import HTTPError, URLError
 from zoneinfo import ZoneInfo
 from dotenv import load_dotenv
-from google_auth import fetch_upcoming_events
+from google_auth import ensure_google_login, fetch_recent_emails, fetch_upcoming_events
+from notion_client import fetch_notion_snapshot
 
 RESET = "\033[0m"
 YOU_COLOR = "\033[94m"
@@ -280,8 +281,12 @@ def build_start_my_day_prompt(user_input):
     time_snapshot = get_current_time_snapshot()
     weather_snapshot = fetch_weather_snapshot(weather_query)
     calendar_snapshot = fetch_upcoming_events()
+    gmail_snapshot = fetch_recent_emails()
+    notion_snapshot = fetch_notion_snapshot()
     day_period = time_snapshot["day_period"]
     agenda_lines = format_calendar_snapshot(calendar_snapshot)
+    gmail_lines = format_gmail_snapshot(gmail_snapshot)
+    notion_lines = format_notion_snapshot(notion_snapshot)
 
     live_data_lines = [
         "LIVE DATA",
@@ -291,11 +296,19 @@ def build_start_my_day_prompt(user_input):
         f"Kalender: {calendar_snapshot['summary']}",
         "Agenda 24 jam ke depan:",
         *agenda_lines,
+        f"Email: {gmail_snapshot['summary']}",
+        "Email terbaru:",
+        *gmail_lines,
+        f"Notion: {notion_snapshot['summary']}",
+        "Notion context:",
+        *notion_lines,
         "Aturan:",
-        "- Gunakan hanya live data yang disediakan di atas untuk waktu, cuaca, dan kalender.",
+        "- Gunakan hanya live data yang disediakan di atas untuk waktu, cuaca, kalender, email, dan Notion.",
         "- Jika ada field yang unavailable, katakan apa adanya.",
         "- Jika cuaca unavailable, sebutkan alasan spesifik yang tertulis di LIVE DATA. Jangan bilang data tidak disediakan aplikasi jika sebenarnya fetch cuaca gagal.",
         "- Jika kalender unavailable, sebutkan alasan spesifik yang tertulis di LIVE DATA.",
+        "- Jika email unavailable, sebutkan alasan spesifik yang tertulis di LIVE DATA.",
+        "- Jika Notion unavailable, sebutkan alasan spesifik yang tertulis di LIVE DATA.",
         "- Jangan mengarang data Notion, Calendar, atau Email jika belum ada data terhubung di pesan ini.",
         "- Gunakan format output yang konsisten dan terminal-friendly.",
         "- Untuk pembuka, gunakan struktur ini persis:",
@@ -304,8 +317,12 @@ def build_start_my_day_prompt(user_input):
         "  - Lokasi: <isi dari LIVE DATA>",
         "  - Cuaca: <isi dari LIVE DATA>",
         "  - Agenda: <ringkas isi dari LIVE DATA kalender>",
+        "  - Email: <ringkas isi dari LIVE DATA email>",
+        "  - Notion: <ringkas isi dari LIVE DATA Notion>",
         f"- Setelah itu, tulis `Brief {day_period}:` lalu beri 2 sampai 4 poin actionable.",
         "- Jika ada agenda, prioritaskan agenda itu dalam brief.",
+        "- Jika ada email yang actionable, prioritaskan email itu dalam brief.",
+        "- Jika ada konteks Notion yang relevan, gunakan itu untuk memprioritaskan brief.",
         f"- Jika cuaca relevan, masukkan saran praktis singkat di `Brief {day_period}:`.",
         f"- Pilih label waktu yang sesuai dengan jam pada LIVE DATA. Untuk jam {time_snapshot['formatted']}, gunakan `{day_period}`, bukan label waktu lain.",
         "",
@@ -328,6 +345,28 @@ def format_calendar_snapshot(calendar_snapshot):
     return lines
 
 
+def format_gmail_snapshot(gmail_snapshot):
+    if gmail_snapshot["status"] != "ok":
+        return [f"- Unavailable: {gmail_snapshot['summary']}"]
+
+    emails = gmail_snapshot.get("emails", [])
+    if not emails:
+        return ["- Tidak ada email baru"]
+
+    lines = []
+    for email in emails:
+        subject = email.get("subject") or "(No subject)"
+        sender = email.get("from") or "(Unknown sender)"
+        snippet = (email.get("snippet") or "").strip()
+
+        line = f"- From: {sender} | Subject: {subject}"
+        if snippet:
+            line += f" | Snippet: {snippet}"
+        lines.append(line)
+
+    return lines
+
+
 def format_event_start(start_value, is_all_day):
     if is_all_day:
         return f"[All day {start_value}]"
@@ -337,6 +376,61 @@ def format_event_start(start_value, is_all_day):
         return event_time.strftime("[%d %b %H:%M]")
     except ValueError:
         return f"[{start_value}]"
+
+
+def format_notion_snapshot(notion_snapshot):
+    if notion_snapshot["status"] != "ok":
+        return [f"- Unavailable: {notion_snapshot['summary']}"]
+
+    lines = []
+    anchors = notion_snapshot.get("anchors", {})
+    execution_anchor = anchors.get("execution")
+    overview_anchor = anchors.get("overview")
+    if execution_anchor:
+        lines.append(f"- Execution anchor: {execution_anchor['title']}")
+    if overview_anchor:
+        lines.append(f"- Overview anchor: {overview_anchor['title']}")
+
+    task_snapshot = notion_snapshot.get("task_snapshot", {})
+    lines.extend(format_notion_tasks(task_snapshot))
+
+    preview_lines = notion_snapshot.get("preview_lines", [])
+    if preview_lines:
+        for line in preview_lines:
+            lines.append(f"- Preview: {line}")
+
+    resources = notion_snapshot.get("resources", [])
+    if resources:
+        for item in resources[:3]:
+            lines.append(f"- Resource {item['object']}: {item['title']}")
+
+    if not lines:
+        return ["- Tidak ada konteks Notion"]
+
+    return lines
+
+
+def format_notion_tasks(task_snapshot):
+    if task_snapshot.get("status") != "ok":
+        return [f"- Daily tasks unavailable: {task_snapshot.get('summary', 'unknown error')}"]
+
+    tasks = task_snapshot.get("tasks", [])
+    if not tasks:
+        return ["- Daily tasks: tidak ada task harian aktif"]
+
+    lines = [f"- Daily tasks: {task_snapshot['summary']}"]
+    for task in tasks[:5]:
+        parts = [task["name"]]
+        if task["priority"]:
+            parts.append(f"priority {task['priority']}")
+        if task["status"]:
+            parts.append(task["status"])
+        if task["date"]:
+            parts.append(task["date"])
+        if task["module"]:
+            parts.append(", ".join(task["module"]))
+        lines.append(f"- Task: {' | '.join(parts)}")
+    return lines
 
 
 def extract_grounding_sources(response):
@@ -416,9 +510,18 @@ chat = client.chats.create(
 
 while True:
     user_input = input(f"{YOU_COLOR}YOU > {RESET}")
-    if user_input.lower() in ["exit", "quit"]:
+    normalized_input = user_input.strip().lower()
+    if normalized_input in ["exit", "quit"]:
         print(f"{FRIDAY_COLOR}FRIDAY ^o^ >{RESET} Session terminated.")
         break
+
+    if normalized_input in ["/login google", "login google", "/login"]:
+        login_result = ensure_google_login()
+        print(
+            f"{FRIDAY_COLOR}FRIDAY ^o^ >{RESET} "
+            f"{sanitize_terminal_output(login_result['summary'])}"
+        )
+        continue
 
     prompt = build_start_my_day_prompt(user_input) if is_start_my_day_request(user_input) else user_input
     response = chat.send_message_stream(prompt)
